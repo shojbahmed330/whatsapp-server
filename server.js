@@ -254,7 +254,7 @@ app.post("/api/whatsapp/control", authMiddleware, async (req, res) => {
 });
 
 app.post("/api/whatsapp/send-bulk", authMiddleware, async (req, res) => {
-  const { campaign_id } = req.body || {};
+  const { campaign_id, retry_failed } = req.body || {};
   if (!campaign_id) return res.status(400).json({ error: "campaign_id required" });
 
   const s = getSession(req.user.id);
@@ -270,6 +270,16 @@ app.post("/api/whatsapp/send-bulk", authMiddleware, async (req, res) => {
     .eq("id", campaign_id)
     .single();
   if (error || !campaign) return res.status(404).json({ error: "Campaign not found" });
+
+  if (retry_failed) {
+    await req.db
+      .from("wa_messages")
+      .update({ status: "pending", error_msg: null, sent_at: null })
+      .eq("campaign_id", campaign.id)
+      .eq("status", "failed");
+    campaign.failed_count = 0;
+    await req.db.from("wa_campaigns").update({ failed_count: 0, status: "running" }).eq("id", campaign.id);
+  }
 
   const workerKey = `${req.user.id}:${campaign.id}`;
   if (activeWorkers.has(workerKey)) return res.json({ ok: true, status: "already_running" });
@@ -374,11 +384,16 @@ async function runCampaign(userId, campaign, token) {
 
       const targetId = numberId ? numberId._serialized : chatId;
 
-      await withTimeout(
-        s.client.sendMessage(targetId, msg.rendered_message || campaign.message_template),
-        45_000,
+      const sentMessage = await withTimeout(
+        s.client.sendMessage(targetId, msg.rendered_message || campaign.message_template, {
+          linkPreview: false,
+          sendSeen: false,
+          waitUntilMsgSent: true,
+        }),
+        90_000,
         "Sending WhatsApp message timed out"
       );
+      if (!sentMessage) throw new Error("WhatsApp could not open this chat");
       sent++; dailyCount++; consecutiveFailures = 0;
       await db.from("wa_messages").update({
         status: "sent", sent_at: new Date().toISOString(),
