@@ -127,6 +127,7 @@ async function authMiddleware(req, res, next) {
 // ---------- per-user WhatsApp clients ----------
 /** Map<userId, { client, ready, phone, qr, controls, token }> */
 const sessions = new Map();
+const activeWorkers = new Set();
 
 function getSession(userId) {
   let s = sessions.get(userId);
@@ -270,10 +271,16 @@ app.post("/api/whatsapp/send-bulk", authMiddleware, async (req, res) => {
     .single();
   if (error || !campaign) return res.status(404).json({ error: "Campaign not found" });
 
+  const workerKey = `${req.user.id}:${campaign.id}`;
+  if (activeWorkers.has(workerKey)) return res.json({ ok: true, status: "already_running" });
+  activeWorkers.add(workerKey);
+
   res.json({ ok: true, status: "started" });
 
   // fire-and-forget worker
-  runCampaign(req.user.id, campaign, req.token).catch((e) => console.error("campaign", e));
+  runCampaign(req.user.id, campaign, req.token)
+    .catch((e) => console.error(`[${req.user.id}] campaign ${campaign.id}`, e))
+    .finally(() => activeWorkers.delete(workerKey));
 });
 
 // ---------- campaign worker ----------
@@ -281,6 +288,12 @@ async function runCampaign(userId, campaign, token) {
   const s = getSession(userId);
   s.controls[campaign.id] = s.controls[campaign.id] || { paused: false, stopped: false };
   const db = makeUserClient(token);
+
+  if (!s.client || !s.ready) {
+    await db.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
+    console.error(`[${userId}] campaign ${campaign.id} cannot start: WhatsApp not connected`);
+    return;
+  }
 
   // daily-limit count (today, this user, status=sent)
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
@@ -291,6 +304,7 @@ async function runCampaign(userId, campaign, token) {
     .gte("sent_at", startOfDay.toISOString());
   let dailyCount = sentToday || 0;
 
+  let campaignPaused = false;
   await db.from("wa_campaigns").update({ status: "running" }).eq("id", campaign.id);
 
   // fetch pending messages for this campaign
@@ -316,6 +330,7 @@ async function runCampaign(userId, campaign, token) {
     if (dailyCount >= campaign.daily_limit) {
       console.log(`[${userId}] daily limit reached`);
       await db.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
+      campaignPaused = true;
       break;
     }
 
@@ -341,16 +356,24 @@ async function runCampaign(userId, campaign, token) {
     try {
       const chatId = msg.phone.replace(/^\+/, "") + "@c.us";
 
-      const isRegistered = await s.client.isRegisteredUser(chatId);
+      const isRegistered = await withTimeout(
+        s.client.isRegisteredUser(chatId),
+        20_000,
+        "WhatsApp number check timed out"
+      );
       if (!isRegistered) throw new Error("Not on WhatsApp");
 
-      const chat = await s.client.getChatById(chatId).catch(() => null);
+      const chat = await withTimeout(s.client.getChatById(chatId), 20_000, "Opening WhatsApp chat timed out").catch(() => null);
       if (chat) {
         await chat.sendStateTyping();
         await sleep(2000 + Math.random() * 1500);
       }
 
-      await s.client.sendMessage(chatId, msg.rendered_message || campaign.message_template);
+      await withTimeout(
+        s.client.sendMessage(chatId, msg.rendered_message || campaign.message_template),
+        30_000,
+        "Sending WhatsApp message timed out"
+      );
       sent++; dailyCount++; consecutiveFailures = 0;
       await db.from("wa_messages").update({
         status: "sent", sent_at: new Date().toISOString(),
@@ -367,6 +390,7 @@ async function runCampaign(userId, campaign, token) {
         await db.from("wa_campaigns").update({
           status: "paused",
         }).eq("id", campaign.id);
+        campaignPaused = true;
         break;
       }
     }
@@ -381,11 +405,17 @@ async function runCampaign(userId, campaign, token) {
     .select("id", { count: "exact", head: true })
     .eq("campaign_id", campaign.id)
     .eq("status", "pending");
-  if (!remaining) {
+  if (!campaignPaused && !remaining) {
     await db.from("wa_campaigns").update({ status: "completed" }).eq("id", campaign.id);
   }
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
 
 server.listen(PORT, () => console.log(`LeadForge WA server listening on :${PORT}`));
