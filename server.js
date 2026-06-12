@@ -147,6 +147,7 @@ function buildClient(userId) {
     authStrategy: new LocalAuth({ clientId: `user-${userId}` }),
     puppeteer: {
       headless: true,
+      protocolTimeout: 180_000,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -364,7 +365,8 @@ async function runCampaign(userId, campaign, token) {
     }
 
     try {
-      const chatId = msg.phone.replace(/^\+/, "") + "@c.us";
+      const normalizedPhone = normalizePhone(msg.phone);
+      const chatId = `${normalizedPhone}@c.us`;
 
       // Try to resolve the real WhatsApp ID. If it returns null → not on WhatsApp.
       // If it times out → skip the check and try sending anyway (whatsapp-web.js
@@ -372,8 +374,8 @@ async function runCampaign(userId, campaign, token) {
       let numberId = null;
       try {
         numberId = await withTimeout(
-          s.client.getNumberId(chatId),
-          15_000,
+          s.client.getNumberId(normalizedPhone),
+          8_000,
           "number-check-timeout"
         );
         if (numberId === null) throw new Error("Not on WhatsApp");
@@ -388,9 +390,9 @@ async function runCampaign(userId, campaign, token) {
         s.client.sendMessage(targetId, msg.rendered_message || campaign.message_template, {
           linkPreview: false,
           sendSeen: false,
-          waitUntilMsgSent: true,
+          waitUntilMsgSent: false,
         }),
-        90_000,
+        45_000,
         "Sending WhatsApp message timed out"
       );
       if (!sentMessage) throw new Error("WhatsApp could not open this chat");
@@ -431,6 +433,9 @@ async function runCampaign(userId, campaign, token) {
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function normalizePhone(phone) {
+  return String(phone || "").replace(/[^0-9]/g, "");
+}
 function withTimeout(promise, ms, message) {
   return Promise.race([
     promise,
