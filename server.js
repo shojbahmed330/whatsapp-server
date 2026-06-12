@@ -18,6 +18,7 @@ const qrcode = require("qrcode");
 const { Server } = require("socket.io");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const { createClient } = require("@supabase/supabase-js");
+const WebSocket = require("ws");
 
 function env(name, ...aliases) {
   for (const key of [name, ...aliases]) {
@@ -73,6 +74,7 @@ const admin = missing.length
   ? null
   : createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { persistSession: false },
+      realtime: { transport: WebSocket },
     });
 
 const app = express();
@@ -87,6 +89,7 @@ async function userFromToken(token) {
   const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${token}` } },
     auth: { persistSession: false },
+    realtime: { transport: WebSocket },
   });
   const { data, error } = await userClient.auth.getUser();
   if (error || !data?.user) return null;
