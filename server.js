@@ -19,12 +19,23 @@ const { Server } = require("socket.io");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const { createClient } = require("@supabase/supabase-js");
 
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  SUPABASE_ANON_KEY,
-  PORT = 3000,
-} = process.env;
+function env(name, ...aliases) {
+  for (const key of [name, ...aliases]) {
+    const value = process.env[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+const SUPABASE_URL = env("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
+const SUPABASE_ANON_KEY = env(
+  "SUPABASE_ANON_KEY",
+  "SUPABASE_PUBLISHABLE_KEY",
+  "VITE_SUPABASE_ANON_KEY",
+  "VITE_SUPABASE_PUBLISHABLE_KEY"
+);
+const PORT = env("PORT") || 3000;
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
@@ -33,13 +44,20 @@ const missing = [
 ].filter(([, v]) => !v).map(([k]) => k);
 
 if (missing.length) {
+  const visibleSupabaseKeys = Object.keys(process.env)
+    .filter((key) => key.includes("SUPABASE") || key.includes("PUBLIC") || key.includes("VITE"))
+    .sort();
   console.error("==================================================");
   console.error("FATAL: missing required environment variables:");
   missing.forEach((k) => console.error("  - " + k));
+  console.error("Environment keys visible to this container:");
+  console.error(visibleSupabaseKeys.length ? "  - " + visibleSupabaseKeys.join("\n  - ") : "  (none found)");
   console.error("Set these in Railway/Render → Variables, then redeploy.");
   console.error("==================================================");
   process.exit(1);
 }
+
+console.log("Environment check passed: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY are available.");
 
 const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
