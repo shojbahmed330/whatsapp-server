@@ -6,9 +6,12 @@
  *
  * Env vars (set on Railway / Render):
  *   SUPABASE_URL                  https://<ref>.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY     server-only key (writes wa_messages, updates wa_campaigns)
- *   SUPABASE_ANON_KEY             used to validate user JWTs
+ *   SUPABASE_ANON_KEY             used to validate user JWTs & for per-user DB ops (RLS)
  *   PORT                          provided by host
+ *
+ * NOTE: We do NOT use SUPABASE_SERVICE_ROLE_KEY. All database writes go through
+ * a per-request authed client using the user's own JWT, which means RLS policies
+ * (auth.uid() = user_id) apply correctly.
  */
 
 const express = require("express");
@@ -29,7 +32,6 @@ function env(name, ...aliases) {
 }
 
 const SUPABASE_URL = env("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
 const SUPABASE_ANON_KEY = env(
   "SUPABASE_ANON_KEY",
   "SUPABASE_PUBLISHABLE_KEY",
@@ -40,7 +42,6 @@ const PORT = env("PORT") || 3000;
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
-  ["SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY],
   ["SUPABASE_ANON_KEY", SUPABASE_ANON_KEY],
 ].filter(([, v]) => !v).map(([k]) => k);
 
@@ -54,7 +55,6 @@ console.log(
   `[boot:${bootId}] Env presence: ` +
     JSON.stringify({
       SUPABASE_URL: Boolean(SUPABASE_URL),
-      SUPABASE_SERVICE_ROLE_KEY: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       SUPABASE_ANON_KEY: Boolean(SUPABASE_ANON_KEY),
     })
 );
@@ -70,13 +70,6 @@ if (missing.length) {
   console.log(`[boot:${bootId}] Environment check passed`);
 }
 
-const admin = missing.length
-  ? null
-  : createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { persistSession: false },
-      realtime: { transport: WebSocket },
-    });
-
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "2mb" }));
@@ -84,16 +77,20 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ---------- helpers ----------
-async function userFromToken(token) {
-  if (!token) return null;
-  const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+function makeUserClient(token) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${token}` } },
     auth: { persistSession: false },
     realtime: { transport: WebSocket },
   });
+}
+
+async function userFromToken(token) {
+  if (!token) return null;
+  const userClient = makeUserClient(token);
   const { data, error } = await userClient.auth.getUser();
   if (error || !data?.user) return null;
-  return data.user;
+  return { user: data.user, db: userClient };
 }
 
 async function authMiddleware(req, res, next) {
@@ -105,20 +102,22 @@ async function authMiddleware(req, res, next) {
     });
   }
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  const user = await userFromToken(token);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
-  req.user = user;
+  const result = await userFromToken(token);
+  if (!result) return res.status(401).json({ error: "Unauthorized" });
+  req.user = result.user;
+  req.db = result.db;
+  req.token = token;
   next();
 }
 
 // ---------- per-user WhatsApp clients ----------
-/** Map<userId, { client, ready, phone, qr, controls: { paused, stopped } }> */
+/** Map<userId, { client, ready, phone, qr, controls, token }> */
 const sessions = new Map();
 
 function getSession(userId) {
   let s = sessions.get(userId);
   if (!s) {
-    s = { client: null, ready: false, phone: null, qr: null, controls: {} };
+    s = { client: null, ready: false, phone: null, qr: null, controls: {}, token: null };
     sessions.set(userId, s);
   }
   return s;
@@ -179,10 +178,10 @@ function buildClient(userId) {
 io.use(async (socket, next) => {
   if (missing.length) return next(new Error(`Missing env vars: ${missing.join(", ")}`));
   const token = socket.handshake.auth?.token;
-  const user = await userFromToken(token);
-  if (!user) return next(new Error("Unauthorized"));
-  socket.data.userId = user.id;
-  socket.join(`user:${user.id}`);
+  const result = await userFromToken(token);
+  if (!result) return next(new Error("Unauthorized"));
+  socket.data.userId = result.user.id;
+  socket.join(`user:${result.user.id}`);
   next();
 });
 
@@ -210,6 +209,7 @@ app.get("/api/whatsapp/status", authMiddleware, (req, res) => {
 
 app.post("/api/whatsapp/connect", authMiddleware, async (req, res) => {
   const s = getSession(req.user.id);
+  s.token = req.token; // store latest token for background campaign worker
   if (s.client && s.ready) return res.json({ status: "already_connected" });
   if (!s.client) {
     s.client = buildClient(req.user.id);
@@ -244,40 +244,42 @@ app.post("/api/whatsapp/send-bulk", authMiddleware, async (req, res) => {
   const s = getSession(req.user.id);
   if (!s.client || !s.ready) return res.status(400).json({ error: "WhatsApp not connected" });
 
-  // verify ownership
-  const { data: campaign, error } = await admin
+  // keep latest token for the worker
+  s.token = req.token;
+
+  // verify ownership (RLS-scoped)
+  const { data: campaign, error } = await req.db
     .from("wa_campaigns")
     .select("*")
     .eq("id", campaign_id)
-    .eq("user_id", req.user.id)
     .single();
   if (error || !campaign) return res.status(404).json({ error: "Campaign not found" });
 
   res.json({ ok: true, status: "started" });
 
   // fire-and-forget worker
-  runCampaign(req.user.id, campaign).catch((e) => console.error("campaign", e));
+  runCampaign(req.user.id, campaign, req.token).catch((e) => console.error("campaign", e));
 });
 
 // ---------- campaign worker ----------
-async function runCampaign(userId, campaign) {
+async function runCampaign(userId, campaign, token) {
   const s = getSession(userId);
   s.controls[campaign.id] = s.controls[campaign.id] || { paused: false, stopped: false };
+  const db = makeUserClient(token);
 
   // daily-limit count (today, this user, status=sent)
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const { count: sentToday } = await admin
+  const { count: sentToday } = await db
     .from("wa_messages")
     .select("id", { count: "exact", head: true })
-    .eq("user_id", userId)
     .eq("status", "sent")
     .gte("sent_at", startOfDay.toISOString());
   let dailyCount = sentToday || 0;
 
-  await admin.from("wa_campaigns").update({ status: "running" }).eq("id", campaign.id);
+  await db.from("wa_campaigns").update({ status: "running" }).eq("id", campaign.id);
 
   // fetch pending messages for this campaign
-  const { data: pending } = await admin
+  const { data: pending } = await db
     .from("wa_messages")
     .select("*")
     .eq("campaign_id", campaign.id)
@@ -289,7 +291,6 @@ async function runCampaign(userId, campaign) {
   let failed = campaign.failed_count || 0;
 
   for (const msg of pending || []) {
-    // refresh control flags
     const ctl = s.controls[campaign.id] || {};
     if (ctl.stopped) break;
     while (ctl.paused && !ctl.stopped) {
@@ -299,38 +300,35 @@ async function runCampaign(userId, campaign) {
 
     if (dailyCount >= campaign.daily_limit) {
       console.log(`[${userId}] daily limit reached`);
-      await admin.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
+      await db.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
       break;
     }
 
     // duplicate prevention: skip if same phone successfully messaged in last 30 days
     const thirtyDaysAgo = new Date(Date.now() - 30 * 86400_000).toISOString();
-    const { data: dup } = await admin
+    const { data: dup } = await db
       .from("wa_messages")
       .select("id")
-      .eq("user_id", userId)
       .eq("phone", msg.phone)
       .eq("status", "sent")
       .gte("sent_at", thirtyDaysAgo)
       .neq("campaign_id", campaign.id)
       .limit(1);
     if (dup && dup.length) {
-      await admin.from("wa_messages").update({
+      await db.from("wa_messages").update({
         status: "failed", error_msg: "Duplicate (sent in last 30 days)", sent_at: new Date().toISOString(),
       }).eq("id", msg.id);
       failed++;
-      await admin.from("wa_campaigns").update({ failed_count: failed }).eq("id", campaign.id);
+      await db.from("wa_campaigns").update({ failed_count: failed }).eq("id", campaign.id);
       continue;
     }
 
     try {
       const chatId = msg.phone.replace(/^\+/, "") + "@c.us";
 
-      // verify number is on WhatsApp
       const isRegistered = await s.client.isRegisteredUser(chatId);
       if (!isRegistered) throw new Error("Not on WhatsApp");
 
-      // human-like: open chat & show typing
       const chat = await s.client.getChatById(chatId).catch(() => null);
       if (chat) {
         await chat.sendStateTyping();
@@ -339,39 +337,37 @@ async function runCampaign(userId, campaign) {
 
       await s.client.sendMessage(chatId, msg.rendered_message || campaign.message_template);
       sent++; dailyCount++; consecutiveFailures = 0;
-      await admin.from("wa_messages").update({
+      await db.from("wa_messages").update({
         status: "sent", sent_at: new Date().toISOString(),
       }).eq("id", msg.id);
-      await admin.from("wa_campaigns").update({ sent_count: sent }).eq("id", campaign.id);
+      await db.from("wa_campaigns").update({ sent_count: sent }).eq("id", campaign.id);
     } catch (err) {
       failed++; consecutiveFailures++;
-      await admin.from("wa_messages").update({
+      await db.from("wa_messages").update({
         status: "failed", error_msg: String(err.message || err).slice(0, 250), sent_at: new Date().toISOString(),
       }).eq("id", msg.id);
-      await admin.from("wa_campaigns").update({ failed_count: failed }).eq("id", campaign.id);
+      await db.from("wa_campaigns").update({ failed_count: failed }).eq("id", campaign.id);
       if (consecutiveFailures >= 3) {
         console.log(`[${userId}] 3 consecutive failures — pausing`);
-        await admin.from("wa_campaigns").update({
-          status: "paused", error_message: "Auto-paused after 3 consecutive failures",
+        await db.from("wa_campaigns").update({
+          status: "paused",
         }).eq("id", campaign.id);
         break;
       }
     }
 
-    // randomised delay: campaign.delay_seconds ± 5s
     const base = campaign.delay_seconds * 1000;
     const wait = Math.max(8000, base + (Math.random() * 10000 - 5000));
     await sleep(wait);
   }
 
-  // mark completed if nothing pending left and not stopped/paused mid-way
-  const { count: remaining } = await admin
+  const { count: remaining } = await db
     .from("wa_messages")
     .select("id", { count: "exact", head: true })
     .eq("campaign_id", campaign.id)
     .eq("status", "pending");
   if (!remaining) {
-    await admin.from("wa_campaigns").update({ status: "completed" }).eq("id", campaign.id);
+    await db.from("wa_campaigns").update({ status: "completed" }).eq("id", campaign.id);
   }
 }
 
