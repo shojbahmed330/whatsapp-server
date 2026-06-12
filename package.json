@@ -11,6 +11,7 @@
     "express": "^4.19.2",
     "qrcode": "^1.5.3",
     "socket.io": "^4.7.5",
-    "whatsapp-web.js": "^1.26.0"
+    "whatsapp-web.js": "^1.26.0",
+    "ws": "^8.18.0"
   }
 }
