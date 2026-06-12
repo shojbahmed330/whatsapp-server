@@ -43,21 +43,32 @@ const missing = [
   ["SUPABASE_ANON_KEY", SUPABASE_ANON_KEY],
 ].filter(([, v]) => !v).map(([k]) => k);
 
+const bootId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+const visibleSupabaseKeys = Object.keys(process.env)
+  .filter((key) => key.includes("SUPABASE") || key.includes("PUBLIC") || key.includes("VITE"))
+  .sort();
+
+console.log(`[boot:${bootId}] LeadForge WhatsApp server starting`);
+console.log(
+  `[boot:${bootId}] Env presence: ` +
+    JSON.stringify({
+      SUPABASE_URL: Boolean(SUPABASE_URL),
+      SUPABASE_SERVICE_ROLE_KEY: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+      SUPABASE_ANON_KEY: Boolean(SUPABASE_ANON_KEY),
+    })
+);
+console.log(
+  `[boot:${bootId}] Visible Supabase-related env keys: ` +
+    (visibleSupabaseKeys.length ? visibleSupabaseKeys.join(", ") : "none")
+);
+
 if (missing.length) {
-  const visibleSupabaseKeys = Object.keys(process.env)
-    .filter((key) => key.includes("SUPABASE") || key.includes("PUBLIC") || key.includes("VITE"))
-    .sort();
-  console.error("==================================================");
-  console.error("FATAL: missing required environment variables:");
-  missing.forEach((k) => console.error("  - " + k));
-  console.error("Environment keys visible to this container:");
-  console.error(visibleSupabaseKeys.length ? "  - " + visibleSupabaseKeys.join("\n  - ") : "  (none found)");
-  console.error("Set these in Railway/Render → Variables, then redeploy.");
-  console.error("==================================================");
+  console.error(`[boot:${bootId}] FATAL missing env vars: ${missing.join(", ")}`);
+  console.error(`[boot:${bootId}] Set them on the deployed service variables, then trigger a fresh deploy.`);
   process.exit(1);
 }
 
-console.log("Environment check passed: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY are available.");
+console.log(`[boot:${bootId}] Environment check passed`);
 
 const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
