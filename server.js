@@ -26,8 +26,18 @@ const {
   PORT = 3000,
 } = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
-  console.error("Missing required env vars");
+const missing = [
+  ["SUPABASE_URL", SUPABASE_URL],
+  ["SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY],
+  ["SUPABASE_ANON_KEY", SUPABASE_ANON_KEY],
+].filter(([, v]) => !v).map(([k]) => k);
+
+if (missing.length) {
+  console.error("==================================================");
+  console.error("FATAL: missing required environment variables:");
+  missing.forEach((k) => console.error("  - " + k));
+  console.error("Set these in Railway/Render → Variables, then redeploy.");
+  console.error("==================================================");
   process.exit(1);
 }
 
