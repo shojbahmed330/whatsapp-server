@@ -1,9 +1,9 @@
 {
   "name": "leadforge-whatsapp-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WhatsApp Bulk Messaging worker for LeadForge (whatsapp-web.js)",
   "main": "server.js",
-  "engines": { "node": ">=18.0.0" },
+  "engines": { "node": ">=20.0.0" },
   "scripts": { "start": "node server.js" },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
