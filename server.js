@@ -50,6 +50,20 @@ const visibleSupabaseKeys = Object.keys(process.env)
   .filter((key) => key.includes("SUPABASE") || key.includes("PUBLIC") || key.includes("VITE"))
   .sort();
 
+function safeUrlFingerprint(url) {
+  try {
+    const u = new URL(url);
+    const [projectRef] = u.hostname.split(".");
+    return {
+      host: u.hostname,
+      projectRefStart: projectRef ? projectRef.slice(0, 6) : null,
+      projectRefEnd: projectRef ? projectRef.slice(-6) : null,
+    };
+  } catch {
+    return { host: "invalid-url", projectRefStart: null, projectRefEnd: null };
+  }
+}
+
 console.log(`[boot:${bootId}] LeadForge WhatsApp server starting`);
 console.log(
   `[boot:${bootId}] Env presence: ` +
@@ -198,6 +212,7 @@ app.get("/", (_req, res) =>
     service: "leadforge-whatsapp",
     mode: missing.length ? "diagnostic" : "ready",
     missing,
+    supabaseUrl: SUPABASE_URL ? safeUrlFingerprint(SUPABASE_URL) : null,
     visibleSupabaseKeys,
   })
 );
