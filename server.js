@@ -356,22 +356,27 @@ async function runCampaign(userId, campaign, token) {
     try {
       const chatId = msg.phone.replace(/^\+/, "") + "@c.us";
 
-      const isRegistered = await withTimeout(
-        s.client.isRegisteredUser(chatId),
-        20_000,
-        "WhatsApp number check timed out"
-      );
-      if (!isRegistered) throw new Error("Not on WhatsApp");
-
-      const chat = await withTimeout(s.client.getChatById(chatId), 20_000, "Opening WhatsApp chat timed out").catch(() => null);
-      if (chat) {
-        await chat.sendStateTyping();
-        await sleep(2000 + Math.random() * 1500);
+      // Try to resolve the real WhatsApp ID. If it returns null → not on WhatsApp.
+      // If it times out → skip the check and try sending anyway (whatsapp-web.js
+      // sometimes hangs on getNumberId even for valid numbers).
+      let numberId = null;
+      try {
+        numberId = await withTimeout(
+          s.client.getNumberId(chatId),
+          15_000,
+          "number-check-timeout"
+        );
+        if (numberId === null) throw new Error("Not on WhatsApp");
+      } catch (e) {
+        if (e.message !== "number-check-timeout") throw e;
+        // fall through — attempt send anyway
       }
 
+      const targetId = numberId ? numberId._serialized : chatId;
+
       await withTimeout(
-        s.client.sendMessage(chatId, msg.rendered_message || campaign.message_template),
-        30_000,
+        s.client.sendMessage(targetId, msg.rendered_message || campaign.message_template),
+        45_000,
         "Sending WhatsApp message timed out"
       );
       sent++; dailyCount++; consecutiveFailures = 0;
