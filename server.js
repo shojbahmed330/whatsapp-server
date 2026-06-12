@@ -63,16 +63,17 @@ console.log(
 );
 
 if (missing.length) {
-  console.error(`[boot:${bootId}] FATAL missing env vars: ${missing.join(", ")}`);
-  console.error(`[boot:${bootId}] Set them on the deployed service variables, then trigger a fresh deploy.`);
-  process.exit(1);
+  console.error(`[boot:${bootId}] CONFIG ERROR missing env vars: ${missing.join(", ")}`);
+  console.error(`[boot:${bootId}] Server will stay online in diagnostic mode until variables are fixed.`);
+} else {
+  console.log(`[boot:${bootId}] Environment check passed`);
 }
 
-console.log(`[boot:${bootId}] Environment check passed`);
-
-const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
+const admin = missing.length
+  ? null
+  : createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+    });
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -93,6 +94,13 @@ async function userFromToken(token) {
 }
 
 async function authMiddleware(req, res, next) {
+  if (missing.length) {
+    return res.status(503).json({
+      error: "WhatsApp server is missing deployment environment variables",
+      missing,
+      visibleSupabaseKeys,
+    });
+  }
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
   const user = await userFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
@@ -166,6 +174,7 @@ function buildClient(userId) {
 
 // ---------- socket.io auth ----------
 io.use(async (socket, next) => {
+  if (missing.length) return next(new Error(`Missing env vars: ${missing.join(", ")}`));
   const token = socket.handshake.auth?.token;
   const user = await userFromToken(token);
   if (!user) return next(new Error("Unauthorized"));
@@ -181,7 +190,15 @@ io.on("connection", (socket) => {
 });
 
 // ---------- REST endpoints ----------
-app.get("/", (_req, res) => res.json({ ok: true, service: "leadforge-whatsapp" }));
+app.get("/", (_req, res) =>
+  res.status(missing.length ? 503 : 200).json({
+    ok: !missing.length,
+    service: "leadforge-whatsapp",
+    mode: missing.length ? "diagnostic" : "ready",
+    missing,
+    visibleSupabaseKeys,
+  })
+);
 
 app.get("/api/whatsapp/status", authMiddleware, (req, res) => {
   const s = getSession(req.user.id);
