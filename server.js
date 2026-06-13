@@ -39,6 +39,7 @@ const SUPABASE_ANON_KEY = env(
   "VITE_SUPABASE_PUBLISHABLE_KEY"
 );
 const PORT = env("PORT") || 3000;
+const SERVER_VERSION = "2026-06-13-send-fallback-v2";
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
@@ -212,6 +213,7 @@ app.get("/", (_req, res) =>
   res.status(missing.length ? 503 : 200).json({
     ok: !missing.length,
     service: "leadforge-whatsapp",
+    version: SERVER_VERSION,
     mode: missing.length ? "diagnostic" : "ready",
     missing,
     supabaseUrl: SUPABASE_URL ? safeUrlFingerprint(SUPABASE_URL) : null,
@@ -366,36 +368,9 @@ async function runCampaign(userId, campaign, token) {
 
     try {
       const normalizedPhone = normalizePhone(msg.phone);
-      const chatId = `${normalizedPhone}@c.us`;
-
-      // Try to resolve the real WhatsApp ID. If it returns null → not on WhatsApp.
-      // If it times out → skip the check and try sending anyway (whatsapp-web.js
-      // sometimes hangs on getNumberId even for valid numbers).
-      let numberId = null;
-      try {
-        numberId = await withTimeout(
-          s.client.getNumberId(normalizedPhone),
-          8_000,
-          "number-check-timeout"
-        );
-        if (numberId === null) throw new Error("Not on WhatsApp");
-      } catch (e) {
-        if (e.message !== "number-check-timeout") throw e;
-        // fall through — attempt send anyway
-      }
-
-      const targetId = numberId ? numberId._serialized : chatId;
-
-      const sentMessage = await withTimeout(
-        s.client.sendMessage(targetId, msg.rendered_message || campaign.message_template, {
-          linkPreview: false,
-          sendSeen: false,
-          waitUntilMsgSent: false,
-        }),
-        45_000,
-        "Sending WhatsApp message timed out"
-      );
-      if (!sentMessage) throw new Error("WhatsApp could not open this chat");
+      const text = msg.rendered_message || campaign.message_template;
+      const sentMessage = await sendTextMessage(s.client, normalizedPhone, text, userId);
+      if (!sentMessage) throw new Error("WhatsApp could not confirm this message was sent");
       sent++; dailyCount++; consecutiveFailures = 0;
       await db.from("wa_messages").update({
         status: "sent", sent_at: new Date().toISOString(),
@@ -433,6 +408,62 @@ async function runCampaign(userId, campaign, token) {
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function sendTextMessage(client, phone, text, userId) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!/^8801\d{9}$/.test(normalizedPhone)) throw new Error("Invalid Bangladesh mobile number");
+
+  let targetId = `${normalizedPhone}@c.us`;
+  try {
+    const numberId = await withTimeout(client.getNumberId(normalizedPhone), 10_000, "number-check-timeout");
+    if (numberId === null) throw new Error("Not on WhatsApp");
+    if (numberId?._serialized) targetId = numberId._serialized;
+  } catch (e) {
+    if (e.message !== "number-check-timeout") throw e;
+    console.warn(`[${userId}] getNumberId timed out for ${normalizedPhone}; trying direct chat id`);
+  }
+
+  try {
+    return await withTimeout(
+      client.sendMessage(targetId, text, { linkPreview: false, sendSeen: false, waitUntilMsgSent: false }),
+      25_000,
+      "library-send-timeout"
+    );
+  } catch (e) {
+    console.warn(`[${userId}] library send failed for ${normalizedPhone}: ${e.message || e}; trying browser compose`);
+    return await sendViaBrowserCompose(client, normalizedPhone, text);
+  }
+}
+
+async function sendViaBrowserCompose(client, normalizedPhone, text) {
+  const page = client.pupPage;
+  if (!page || page.isClosed()) throw new Error("WhatsApp browser page is not available");
+
+  const chatUrl = `https://web.whatsapp.com/send?phone=${normalizedPhone}&text=${encodeURIComponent(text)}&app_absent=0`;
+  await page.goto(chatUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+  await page.waitForSelector('div[contenteditable="true"][role="textbox"]', { timeout: 45_000 });
+  await page.evaluate(() => {
+    const boxes = [...document.querySelectorAll('div[contenteditable="true"][role="textbox"]')];
+    boxes[boxes.length - 1]?.focus();
+  });
+  await sleep(750);
+
+  const before = await page.evaluate(() => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length);
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(
+    (previousCount) => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length > previousCount,
+    { timeout: 20_000 },
+    before
+  ).catch(() => null);
+
+  const stillHasText = await page.evaluate(() => {
+    const boxes = [...document.querySelectorAll('div[contenteditable="true"][role="textbox"]')];
+    return Boolean(boxes[boxes.length - 1]?.textContent?.trim());
+  });
+  if (stillHasText) throw new Error("WhatsApp browser compose did not send the message");
+  return { id: { _serialized: `browser-compose-${Date.now()}` } };
+}
+
 function normalizePhone(phone) {
   return String(phone || "").replace(/[^0-9]/g, "");
 }
