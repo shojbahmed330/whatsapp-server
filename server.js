@@ -39,7 +39,7 @@ const SUPABASE_ANON_KEY = env(
   "VITE_SUPABASE_PUBLISHABLE_KEY"
 );
 const PORT = env("PORT") || 3000;
-const SERVER_VERSION = "2026-06-13-send-fallback-v2";
+const SERVER_VERSION = "2026-06-13-confirmed-ack-v4";
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
@@ -423,45 +423,217 @@ async function sendTextMessage(client, phone, text, userId) {
     console.warn(`[${userId}] getNumberId timed out for ${normalizedPhone}; trying direct chat id`);
   }
 
+  let sentMessage;
   try {
-    return await withTimeout(
-      client.sendMessage(targetId, text, { linkPreview: false, sendSeen: false, waitUntilMsgSent: false }),
-      25_000,
-      "library-send-timeout"
+    sentMessage = await withTimeout(
+      client.sendMessage(targetId, text, { linkPreview: false, sendSeen: false, waitUntilMsgSent: true }),
+      60_000,
+      "WhatsApp message send timed out before server confirmation"
     );
   } catch (e) {
-    console.warn(`[${userId}] library send failed for ${normalizedPhone}: ${e.message || e}; trying browser compose`);
-    return await sendViaBrowserCompose(client, normalizedPhone, text);
+    const message = String(e?.message || e || "WhatsApp send failed");
+    console.warn(`[${userId}] confirmed library send failed for ${normalizedPhone}: ${message}`);
+    throw new Error(message.includes("Waiting for selector")
+      ? "WhatsApp Web UI changed or chat did not open; message was not confirmed sent"
+      : message);
+  }
+
+  await confirmMessageServerAck(client, sentMessage, targetId, userId, normalizedPhone);
+  return sentMessage;
+}
+
+async function confirmMessageServerAck(client, sentMessage, targetId, userId, normalizedPhone) {
+  const messageId = sentMessage?.id?._serialized;
+  if (!messageId) throw new Error("WhatsApp did not return a message id");
+
+  const initialAck = Number.isFinite(sentMessage.ack) ? sentMessage.ack : -99;
+  if (initialAck >= 1) return;
+  if (initialAck < 0) throw new Error("WhatsApp rejected the message");
+
+  const ack = await waitForMessageAck(client, messageId, 45_000);
+  if (ack >= 1) return;
+
+  const pageAck = await readMessageAckFromStore(client, messageId);
+  if (pageAck >= 1) return;
+
+  const state = await getClientConnectionState(client);
+  console.warn(`[${userId}] no server ack for ${normalizedPhone} (${targetId}, ${messageId}); state=${state}; ack=${ack}; pageAck=${pageAck}`);
+  throw new Error("WhatsApp did not confirm delivery to server; message not marked sent");
+}
+
+function waitForMessageAck(client, messageId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    let bestAck = -99;
+    const finish = (ack) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      client.off("message_ack", onAck);
+      resolve(ack);
+    };
+    const onAck = (msg, ack) => {
+      if (msg?.id?._serialized !== messageId) return;
+      bestAck = Math.max(bestAck, Number(ack));
+      if (bestAck >= 1 || bestAck < 0) finish(bestAck);
+    };
+    const timer = setTimeout(() => finish(bestAck), timeoutMs);
+    client.on("message_ack", onAck);
+  });
+}
+
+async function readMessageAckFromStore(client, messageId) {
+  try {
+    return await client.pupPage.evaluate(async (id) => {
+      const store = window.require?.("WAWebCollections")?.Msg;
+      const msg = store?.get(id) || (await store?.getMessagesById?.([id]))?.messages?.[0];
+      return typeof msg?.ack === "number" ? msg.ack : -99;
+    }, messageId);
+  } catch {
+    return -99;
   }
 }
 
-async function sendViaBrowserCompose(client, normalizedPhone, text) {
+async function getClientConnectionState(client) {
+  try {
+    return await client.getState();
+  } catch {
+    return "unknown";
+  }
+}
+
+const COMPOSER_SELECTORS = [
+  'footer div[contenteditable="true"][role="textbox"]',
+  'footer div[contenteditable="true"][data-lexical-editor="true"]',
+  'footer div[contenteditable="true"][data-tab]',
+  'footer div[contenteditable="true"]',
+  'div[contenteditable="true"][role="textbox"]',
+  'div[contenteditable="true"][data-lexical-editor="true"]',
+  'div[contenteditable="true"][data-tab]',
+  'div[contenteditable="true"]',
+];
+
+const SEND_BUTTON_SELECTORS = [
+  'button[aria-label="Send"]',
+  'button[aria-label*="Send"]',
+  'div[role="button"][aria-label="Send"]',
+  'div[role="button"][aria-label*="Send"]',
+  'span[data-icon="send"]',
+  '[data-icon="send"]',
+];
+
+async function sendViaBrowserCompose(client, normalizedPhone, text, userId) {
   const page = client.pupPage;
   if (!page || page.isClosed()) throw new Error("WhatsApp browser page is not available");
 
   const chatUrl = `https://web.whatsapp.com/send?phone=${normalizedPhone}&text=${encodeURIComponent(text)}&app_absent=0`;
   await page.goto(chatUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  await page.waitForSelector('div[contenteditable="true"][role="textbox"]', { timeout: 45_000 });
-  await page.evaluate(() => {
-    const boxes = [...document.querySelectorAll('div[contenteditable="true"][role="textbox"]')];
-    boxes[boxes.length - 1]?.focus();
-  });
+
+  const composerSelector = await waitForComposeOrFailure(page, normalizedPhone, 60_000);
+  await page.evaluate((selectors, preferredSelector) => {
+    const preferred = preferredSelector ? document.querySelector(preferredSelector) : null;
+    const fallback = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
+    const box = preferred || fallback;
+    if (box) {
+      box.scrollIntoView({ block: "center", inline: "nearest" });
+      box.focus();
+    }
+  }, COMPOSER_SELECTORS, composerSelector);
   await sleep(750);
 
-  const before = await page.evaluate(() => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length);
-  await page.keyboard.press("Enter");
-  await page.waitForFunction(
-    (previousCount) => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length > previousCount,
-    { timeout: 20_000 },
-    before
-  ).catch(() => null);
+  await ensureComposerHasText(page, text);
+  const before = await countOutgoingMarkers(page);
+  const clickedSend = await clickSendButton(page);
+  if (!clickedSend) await page.keyboard.press("Enter");
 
-  const stillHasText = await page.evaluate(() => {
-    const boxes = [...document.querySelectorAll('div[contenteditable="true"][role="textbox"]')];
-    return Boolean(boxes[boxes.length - 1]?.textContent?.trim());
-  });
-  if (stillHasText) throw new Error("WhatsApp browser compose did not send the message");
+  const sentOrCleared = await page.waitForFunction(
+    ({ selectors, previousCount }) => {
+      const boxes = selectors.map((selector) => document.querySelector(selector)).filter(Boolean);
+      const box = boxes[boxes.length - 1];
+      const stillHasText = Boolean(box?.textContent?.trim());
+      const markerCount = document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length;
+      return !stillHasText || markerCount > previousCount;
+    },
+    { timeout: 20_000 },
+    { selectors: COMPOSER_SELECTORS, previousCount: before }
+  ).then(() => true).catch(() => false);
+
+  if (!sentOrCleared) {
+    const state = await getWhatsAppPageState(page);
+    console.warn(`[${userId}] browser compose did not confirm send for ${normalizedPhone}: ${JSON.stringify(state)}`);
+    throw new Error(state.reason || "WhatsApp browser compose did not send the message");
+  }
+
   return { id: { _serialized: `browser-compose-${Date.now()}` } };
+}
+
+async function waitForComposeOrFailure(page, normalizedPhone, timeoutMs) {
+  const started = Date.now();
+  let lastState = null;
+  while (Date.now() - started < timeoutMs) {
+    lastState = await getWhatsAppPageState(page);
+    if (lastState.composerSelector || lastState.hasSendButton) return lastState.composerSelector;
+    if (lastState.reason) throw new Error(lastState.reason);
+    await sleep(1000);
+  }
+  throw new Error(lastState?.summary || `WhatsApp chat composer did not open for ${normalizedPhone}`);
+}
+
+async function getWhatsAppPageState(page) {
+  return await page.evaluate(({ composerSelectors, sendButtonSelectors }) => {
+    const bodyText = document.body?.innerText || "";
+    const composerSelector = composerSelectors.find((selector) => document.querySelector(selector)) || null;
+    const hasSendButton = sendButtonSelectors.some((selector) => document.querySelector(selector));
+    const lower = bodyText.toLowerCase();
+    let reason = null;
+    if (lower.includes("phone number shared via url is invalid") || lower.includes("invalid phone number")) {
+      reason = "WhatsApp says this phone number is invalid";
+    } else if (lower.includes("not a whatsapp user") || lower.includes("couldn't look up phone number")) {
+      reason = "This phone number is not on WhatsApp";
+    } else if ((lower.includes("scan this qr code") || lower.includes("link with phone number")) && !composerSelector) {
+      reason = "WhatsApp session expired. Reconnect WhatsApp";
+    } else if ((lower.includes("computer not connected") || lower.includes("trying to reach phone")) && !composerSelector) {
+      reason = "WhatsApp Web is offline. Keep the phone and server connected";
+    }
+    return {
+      url: location.href,
+      composerSelector,
+      hasSendButton,
+      reason,
+      summary: `WhatsApp composer not found. URL=${location.href}; text=${bodyText.slice(0, 180).replace(/\s+/g, " ")}`,
+    };
+  }, { composerSelectors: COMPOSER_SELECTORS, sendButtonSelectors: SEND_BUTTON_SELECTORS });
+}
+
+async function ensureComposerHasText(page, text) {
+  const hasText = await page.evaluate((selectors) => {
+    const boxes = selectors.map((selector) => document.querySelector(selector)).filter(Boolean);
+    const box = boxes[boxes.length - 1];
+    if (!box) return false;
+    box.focus();
+    return Boolean(box.textContent?.trim());
+  }, COMPOSER_SELECTORS);
+
+  if (!hasText) {
+    await page.keyboard.type(text, { delay: 0 });
+  }
+}
+
+async function clickSendButton(page) {
+  return await page.evaluate((selectors) => {
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (!el) continue;
+      const clickable = el.closest('button, div[role="button"], span[role="button"]') || el;
+      clickable.click();
+      return true;
+    }
+    return false;
+  }, SEND_BUTTON_SELECTORS);
+}
+
+async function countOutgoingMarkers(page) {
+  return await page.evaluate(() => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length);
 }
 
 function normalizePhone(phone) {
