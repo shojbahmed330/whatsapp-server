@@ -105,8 +105,13 @@ function makeUserClient(token) {
 async function userFromToken(token) {
   if (!token) return null;
   const userClient = makeUserClient(token);
-  const { data, error } = await userClient.auth.getUser();
-  if (error || !data?.user) return null;
+  // IMPORTANT: pass the JWT explicitly. Newer @supabase/supabase-js versions
+  // require this when persistSession:false (no internal session to read from).
+  const { data, error } = await userClient.auth.getUser(token);
+  if (error || !data?.user) {
+    if (error) console.warn(`[auth] getUser failed: ${error.message ?? error}`);
+    return null;
+  }
   return { user: data.user, db: userClient };
 }
 
