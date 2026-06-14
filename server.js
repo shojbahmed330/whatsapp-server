@@ -39,8 +39,8 @@ const SUPABASE_ANON_KEY = env(
   "VITE_SUPABASE_PUBLISHABLE_KEY"
 );
 const PORT = env("PORT") || 3000;
-const SERVER_VERSION = "2026-06-13-safer-send-v5";
-const MIN_DELAY_BETWEEN_MESSAGES_MS = 30_000;
+const SERVER_VERSION = "2026-06-14-browser-fallback-v6";
+const MIN_DELAY_BETWEEN_MESSAGES_MS = 5_000;
 const SEND_RETRY_LIMIT = 2;
 
 const missing = [
@@ -379,6 +379,16 @@ async function runCampaign(userId, campaign, token) {
       }).eq("id", msg.id);
       await db.from("wa_campaigns").update({ sent_count: sent }).eq("id", campaign.id);
     } catch (err) {
+      if (shouldPauseCampaignOnError(err)) {
+        const reason = String(err.message || err).slice(0, 250);
+        console.warn(`[${userId}] pausing campaign ${campaign.id} without consuming contact ${msg.phone}: ${reason}`);
+        await db.from("wa_messages").update({
+          status: "pending", error_msg: reason, sent_at: null,
+        }).eq("id", msg.id);
+        await db.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
+        campaignPaused = true;
+        break;
+      }
       failed++; consecutiveFailures++;
       await db.from("wa_messages").update({
         status: "failed", error_msg: String(err.message || err).slice(0, 250), sent_at: new Date().toISOString(),
@@ -413,12 +423,23 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function sendTextMessage(client, phone, text, userId) {
   const messageRisk = inspectMessageRisk(text);
+  const normalizedPhone = normalizePhone(phone);
   let lastError;
   for (let attempt = 1; attempt <= SEND_RETRY_LIMIT; attempt++) {
     try {
-      return await sendTextMessageOnce(client, phone, text, userId);
+      await ensureWhatsAppReadyForSend(client);
+      return await sendTextMessageOnce(client, normalizedPhone, text, userId);
     } catch (err) {
       lastError = normalizeSendError(err, messageRisk);
+      if (shouldUseBrowserComposeFallback(err)) {
+        try {
+          console.warn(`[${userId}] internal send failed for ${normalizedPhone}; trying browser compose fallback: ${lastError.message}`);
+          await recoverWhatsAppWeb(client, userId);
+          return await sendViaBrowserCompose(client, normalizedPhone, text, userId);
+        } catch (fallbackErr) {
+          lastError = normalizeSendError(fallbackErr, messageRisk);
+        }
+      }
       if (!shouldRetrySend(err, attempt, messageRisk)) throw lastError;
       console.warn(`[${userId}] send attempt ${attempt} failed; recovering WhatsApp Web before retry: ${lastError.message}`);
       await recoverWhatsAppWeb(client, userId);
@@ -459,6 +480,27 @@ async function sendTextMessageOnce(client, phone, text, userId) {
 
   await confirmMessageServerAck(client, sentMessage, targetId, userId, normalizedPhone);
   return sentMessage;
+}
+
+async function ensureWhatsAppReadyForSend(client) {
+  const state = await getClientConnectionState(client);
+  if (state && state !== "unknown" && String(state).toUpperCase() !== "CONNECTED") {
+    throw makeSendError(`WhatsApp is not ready (${state}). Reconnect WhatsApp and try again.`, "WA_NOT_READY");
+  }
+  const pageState = await getWhatsAppPageStateSafe(client);
+  if (pageState?.reason) throw makeSendError(pageState.reason, "WA_NOT_READY");
+}
+
+function shouldUseBrowserComposeFallback(err) {
+  const code = err?.code;
+  const message = String(err?.message || err || "");
+  return code === "WA_ACK_ERROR" || code === "WA_SELECTOR" || code === "WA_ACK_TIMEOUT" || /send timed out|Waiting for selector/i.test(message);
+}
+
+function shouldPauseCampaignOnError(err) {
+  const code = err?.code;
+  const message = String(err?.message || err || "");
+  return code === "WA_NOT_READY" || /reconnect whatsapp|session expired|not ready|browser page is not available|phone and server connected/i.test(message);
 }
 
 async function confirmMessageServerAck(client, sentMessage, targetId, userId, normalizedPhone) {
@@ -612,26 +654,23 @@ async function sendViaBrowserCompose(client, normalizedPhone, text, userId) {
   await sleep(750);
 
   await ensureComposerHasText(page, text);
-  const before = await countOutgoingMarkers(page);
+  const before = await countServerAckMarkers(page);
   const clickedSend = await clickSendButton(page);
   if (!clickedSend) await page.keyboard.press("Enter");
 
-  const sentOrCleared = await page.waitForFunction(
-    ({ selectors, previousCount }) => {
-      const boxes = selectors.map((selector) => document.querySelector(selector)).filter(Boolean);
-      const box = boxes[boxes.length - 1];
-      const stillHasText = Boolean(box?.textContent?.trim());
-      const markerCount = document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length;
-      return !stillHasText || markerCount > previousCount;
+  const serverAckVisible = await page.waitForFunction(
+    ({ previousCount }) => {
+      const markerCount = document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"]').length;
+      return markerCount > previousCount;
     },
-    { timeout: 20_000 },
-    { selectors: COMPOSER_SELECTORS, previousCount: before }
+    { timeout: 60_000 },
+    { previousCount: before }
   ).then(() => true).catch(() => false);
 
-  if (!sentOrCleared) {
+  if (!serverAckVisible) {
     const state = await getWhatsAppPageState(page);
     console.warn(`[${userId}] browser compose did not confirm send for ${normalizedPhone}: ${JSON.stringify(state)}`);
-    throw new Error(state.reason || "WhatsApp browser compose did not send the message");
+    throw makeSendError(state.reason || "WhatsApp browser compose did not confirm server delivery", "WA_ACK_TIMEOUT");
   }
 
   return { id: { _serialized: `browser-compose-${Date.now()}` } };
@@ -675,18 +714,33 @@ async function getWhatsAppPageState(page) {
   }, { composerSelectors: COMPOSER_SELECTORS, sendButtonSelectors: SEND_BUTTON_SELECTORS });
 }
 
+async function getWhatsAppPageStateSafe(client) {
+  try {
+    const page = client.pupPage;
+    if (!page || page.isClosed()) return { reason: "WhatsApp browser page is not available. Reconnect WhatsApp" };
+    return await getWhatsAppPageState(page);
+  } catch {
+    return null;
+  }
+}
+
 async function ensureComposerHasText(page, text) {
-  const hasText = await page.evaluate((selectors) => {
+  const hasExpectedText = await page.evaluate((selectors, expected) => {
     const boxes = selectors.map((selector) => document.querySelector(selector)).filter(Boolean);
     const box = boxes[boxes.length - 1];
     if (!box) return false;
     box.focus();
-    return Boolean(box.textContent?.trim());
-  }, COMPOSER_SELECTORS);
+    const current = (box.textContent || "").trim();
+    return current.includes(String(expected || "").trim().slice(0, 40));
+  }, COMPOSER_SELECTORS, text);
 
-  if (!hasText) {
-    await page.keyboard.type(text, { delay: 0 });
-  }
+  if (hasExpectedText) return;
+
+  await page.keyboard.down(process.platform === "darwin" ? "Meta" : "Control");
+  await page.keyboard.press("A");
+  await page.keyboard.up(process.platform === "darwin" ? "Meta" : "Control");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type(text, { delay: 0 });
 }
 
 async function clickSendButton(page) {
@@ -702,8 +756,8 @@ async function clickSendButton(page) {
   }, SEND_BUTTON_SELECTORS);
 }
 
-async function countOutgoingMarkers(page) {
-  return await page.evaluate(() => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-time"]').length);
+async function countServerAckMarkers(page) {
+  return await page.evaluate(() => document.querySelectorAll('[data-icon="msg-check"], [data-icon="msg-dblcheck"]').length);
 }
 
 function normalizePhone(phone) {
