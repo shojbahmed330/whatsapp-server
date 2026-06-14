@@ -39,7 +39,9 @@ const SUPABASE_ANON_KEY = env(
   "VITE_SUPABASE_PUBLISHABLE_KEY"
 );
 const PORT = env("PORT") || 3000;
-const SERVER_VERSION = "2026-06-13-confirmed-ack-v4";
+const SERVER_VERSION = "2026-06-13-safer-send-v5";
+const MIN_DELAY_BETWEEN_MESSAGES_MS = 30_000;
+const SEND_RETRY_LIMIT = 2;
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
@@ -392,8 +394,8 @@ async function runCampaign(userId, campaign, token) {
       }
     }
 
-    const base = campaign.delay_seconds * 1000;
-    const wait = Math.max(8000, base + (Math.random() * 10000 - 5000));
+    const base = Math.max(MIN_DELAY_BETWEEN_MESSAGES_MS, (Number(campaign.delay_seconds) || 15) * 1000);
+    const wait = base + Math.floor(Math.random() * 15_000);
     await sleep(wait);
   }
 
@@ -410,6 +412,23 @@ async function runCampaign(userId, campaign, token) {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function sendTextMessage(client, phone, text, userId) {
+  const messageRisk = inspectMessageRisk(text);
+  let lastError;
+  for (let attempt = 1; attempt <= SEND_RETRY_LIMIT; attempt++) {
+    try {
+      return await sendTextMessageOnce(client, phone, text, userId);
+    } catch (err) {
+      lastError = normalizeSendError(err, messageRisk);
+      if (!shouldRetrySend(err, attempt, messageRisk)) throw lastError;
+      console.warn(`[${userId}] send attempt ${attempt} failed; recovering WhatsApp Web before retry: ${lastError.message}`);
+      await recoverWhatsAppWeb(client, userId);
+      await sleep(18_000 + Math.floor(Math.random() * 12_000));
+    }
+  }
+  throw lastError || new Error("WhatsApp send failed");
+}
+
+async function sendTextMessageOnce(client, phone, text, userId) {
   const normalizedPhone = normalizePhone(phone);
   if (!/^8801\d{9}$/.test(normalizedPhone)) throw new Error("Invalid Bangladesh mobile number");
 
@@ -433,9 +452,9 @@ async function sendTextMessage(client, phone, text, userId) {
   } catch (e) {
     const message = String(e?.message || e || "WhatsApp send failed");
     console.warn(`[${userId}] confirmed library send failed for ${normalizedPhone}: ${message}`);
-    throw new Error(message.includes("Waiting for selector")
+    throw makeSendError(message.includes("Waiting for selector")
       ? "WhatsApp Web UI changed or chat did not open; message was not confirmed sent"
-      : message);
+      : message, message.includes("Waiting for selector") ? "WA_SELECTOR" : "WA_SEND_FAILED");
   }
 
   await confirmMessageServerAck(client, sentMessage, targetId, userId, normalizedPhone);
@@ -448,7 +467,7 @@ async function confirmMessageServerAck(client, sentMessage, targetId, userId, no
 
   const initialAck = Number.isFinite(sentMessage.ack) ? sentMessage.ack : -99;
   if (initialAck >= 1) return;
-  if (initialAck < 0) throw new Error("WhatsApp rejected the message");
+  if (initialAck < 0) throw makeSendError("WhatsApp rejected the message", "WA_ACK_ERROR");
 
   const ack = await waitForMessageAck(client, messageId, 45_000);
   if (ack >= 1) return;
@@ -458,7 +477,58 @@ async function confirmMessageServerAck(client, sentMessage, targetId, userId, no
 
   const state = await getClientConnectionState(client);
   console.warn(`[${userId}] no server ack for ${normalizedPhone} (${targetId}, ${messageId}); state=${state}; ack=${ack}; pageAck=${pageAck}`);
-  throw new Error("WhatsApp did not confirm delivery to server; message not marked sent");
+  throw makeSendError("WhatsApp did not confirm delivery to server; message not marked sent", "WA_ACK_TIMEOUT");
+}
+
+function makeSendError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function inspectMessageRisk(text) {
+  const message = String(text || "");
+  const urls = (message.match(/https?:\/\/|www\.|\.com|\.net|\.org|\.io|\.app/gi) || []).length;
+  const emoji = (message.match(/[\u{1F300}-\u{1FAFF}]/gu) || []).length;
+  const lines = message.split(/\r?\n/).filter((line) => line.trim()).length;
+  const isHighRisk = message.length > 500 || urls > 1 || emoji > 6 || lines > 10;
+  return { isHighRisk, length: message.length, urls, emoji, lines };
+}
+
+function normalizeSendError(err, risk) {
+  const message = String(err?.message || err || "WhatsApp send failed");
+  const code = err?.code || "WA_SEND_FAILED";
+  if (code === "WA_ACK_ERROR") {
+    return makeSendError(
+      risk.isHighRisk
+        ? `WhatsApp rejected the message before server delivery. Message looks too promotional/long (${risk.length} chars, ${risk.emoji} emoji, ${risk.urls} links); shorten it and use a slower delay.`
+        : "WhatsApp rejected the message before server delivery. This usually means the account, number, or content was rate-limited by WhatsApp.",
+      code
+    );
+  }
+  return makeSendError(message, code);
+}
+
+function shouldRetrySend(err, attempt, risk) {
+  if (attempt >= SEND_RETRY_LIMIT) return false;
+  const code = err?.code;
+  if (code === "WA_SELECTOR" || code === "WA_ACK_TIMEOUT") return true;
+  if (code === "WA_ACK_ERROR") return !risk.isHighRisk;
+  return /timeout|detached|navigation|protocol|execution context|target closed/i.test(String(err?.message || err || ""));
+}
+
+async function recoverWhatsAppWeb(client, userId) {
+  try {
+    if (typeof client.resetState === "function") await withTimeout(client.resetState(), 20_000, "resetState-timeout");
+  } catch (e) {
+    console.warn(`[${userId}] resetState failed: ${String(e?.message || e)}`);
+  }
+  try {
+    const page = client.pupPage;
+    if (page && !page.isClosed()) await page.goto("https://web.whatsapp.com/", { waitUntil: "domcontentloaded", timeout: 45_000 });
+  } catch (e) {
+    console.warn(`[${userId}] WhatsApp Web reload failed: ${String(e?.message || e)}`);
+  }
 }
 
 function waitForMessageAck(client, messageId, timeoutMs) {
