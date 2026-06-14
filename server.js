@@ -39,9 +39,10 @@ const SUPABASE_ANON_KEY = env(
   "VITE_SUPABASE_PUBLISHABLE_KEY"
 );
 const PORT = env("PORT") || 3000;
-const SERVER_VERSION = "2026-06-14-browser-fallback-v6";
+const SERVER_VERSION = "2026-06-14-stuck-send-timeout-v7";
 const MIN_DELAY_BETWEEN_MESSAGES_MS = 5_000;
 const SEND_RETRY_LIMIT = 2;
+const MESSAGE_SEND_TIMEOUT_MS = 150_000;
 
 const missing = [
   ["SUPABASE_URL", SUPABASE_URL],
@@ -332,7 +333,7 @@ async function runCampaign(userId, campaign, token) {
     .from("wa_messages")
     .select("*")
     .eq("campaign_id", campaign.id)
-    .eq("status", "pending")
+    .in("status", ["pending", "sending"])
     .order("created_at", { ascending: true });
 
   let consecutiveFailures = 0;
@@ -376,27 +377,35 @@ async function runCampaign(userId, campaign, token) {
     try {
       const normalizedPhone = normalizePhone(msg.phone);
       const text = msg.rendered_message || campaign.message_template;
-      const sentMessage = await sendTextMessage(s.client, normalizedPhone, text, userId);
+      await db.from("wa_messages").update({
+        status: "sending", error_msg: null,
+      }).eq("id", msg.id);
+
+      const sentMessage = await withTimeout(
+        sendTextMessage(s.client, normalizedPhone, text, userId),
+        MESSAGE_SEND_TIMEOUT_MS,
+        "WhatsApp send got stuck. Reconnect WhatsApp, then retry send."
+      );
       if (!sentMessage) throw new Error("WhatsApp could not confirm this message was sent");
       sent++; dailyCount++; consecutiveFailures = 0;
       await db.from("wa_messages").update({
-        status: "sent", sent_at: new Date().toISOString(),
+        status: "sent", error_msg: null, sent_at: new Date().toISOString(),
       }).eq("id", msg.id);
       await db.from("wa_campaigns").update({ sent_count: sent }).eq("id", campaign.id);
     } catch (err) {
       if (shouldPauseCampaignOnError(err)) {
         const reason = String(err.message || err).slice(0, 250);
         console.warn(`[${userId}] pausing campaign ${campaign.id} without consuming contact ${msg.phone}: ${reason}`);
-        await db.from("wa_messages").update({
-          status: "pending", error_msg: reason, sent_at: null,
-        }).eq("id", msg.id);
+        await db.from("wa_messages").update({ status: "pending", error_msg: reason, sent_at: null }).eq("id", msg.id);
         await db.from("wa_campaigns").update({ status: "paused" }).eq("id", campaign.id);
         campaignPaused = true;
         break;
       }
       failed++; consecutiveFailures++;
+      const errorMessage = String(err.message || err).slice(0, 250);
+      const failedStatus = /got stuck|reconnect whatsapp|not ready|browser page is not available/i.test(errorMessage) ? "pending" : "failed";
       await db.from("wa_messages").update({
-        status: "failed", error_msg: String(err.message || err).slice(0, 250), sent_at: new Date().toISOString(),
+        status: failedStatus, error_msg: errorMessage, sent_at: failedStatus === "failed" ? new Date().toISOString() : null,
       }).eq("id", msg.id);
       await db.from("wa_campaigns").update({ failed_count: failed }).eq("id", campaign.id);
       if (consecutiveFailures >= 3) {
@@ -418,7 +427,7 @@ async function runCampaign(userId, campaign, token) {
     .from("wa_messages")
     .select("id", { count: "exact", head: true })
     .eq("campaign_id", campaign.id)
-    .eq("status", "pending");
+    .in("status", ["pending", "sending"]);
   if (!campaignPaused && !remaining) {
     await db.from("wa_campaigns").update({ status: "completed" }).eq("id", campaign.id);
   }
